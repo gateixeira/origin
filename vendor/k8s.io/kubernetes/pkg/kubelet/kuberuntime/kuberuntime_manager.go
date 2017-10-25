@@ -64,9 +64,10 @@ var (
 	ErrVersionNotSupported = errors.New("Runtime api version is not supported")
 )
 
-// podDeletionProvider can determine if a pod is deleted
-type podDeletionProvider interface {
+// podStateProvider can determine if a pod is deleted ir terminated
+type podStateProvider interface {
 	IsPodDeleted(kubetypes.UID) bool
+	IsPodTerminated(kubetypes.UID) bool
 }
 
 type kubeGenericRuntimeManager struct {
@@ -105,6 +106,9 @@ type kubeGenericRuntimeManager struct {
 
 	// The version cache of runtime daemon.
 	versionCache *cache.ObjectCache
+
+	// A shim to legacy functions for backward compatibility.
+	legacyLogProvider LegacyLogProvider
 }
 
 type KubeGenericRuntime interface {
@@ -113,13 +117,19 @@ type KubeGenericRuntime interface {
 	kubecontainer.ContainerCommandRunner
 }
 
+// LegacyLogProvider gives the ability to use unsupported docker log drivers (e.g. journald)
+type LegacyLogProvider interface {
+	// Get the last few lines of the logs for a specific container.
+	GetContainerLogTail(uid kubetypes.UID, name, namespace string, containerID kubecontainer.ContainerID) (string, error)
+}
+
 // NewKubeGenericRuntimeManager creates a new kubeGenericRuntimeManager
 func NewKubeGenericRuntimeManager(
 	recorder record.EventRecorder,
 	livenessManager proberesults.Manager,
 	containerRefManager *kubecontainer.RefManager,
 	machineInfo *cadvisorapi.MachineInfo,
-	podDeletionProvider podDeletionProvider,
+	podStateProvider podStateProvider,
 	osInterface kubecontainer.OSInterface,
 	runtimeHelper kubecontainer.RuntimeHelper,
 	httpClient types.HttpGetter,
@@ -130,6 +140,7 @@ func NewKubeGenericRuntimeManager(
 	cpuCFSQuota bool,
 	runtimeService internalapi.RuntimeService,
 	imageService internalapi.ImageManagerService,
+	legacyLogProvider LegacyLogProvider,
 ) (KubeGenericRuntime, error) {
 	kubeRuntimeManager := &kubeGenericRuntimeManager{
 		recorder:            recorder,
@@ -142,6 +153,7 @@ func NewKubeGenericRuntimeManager(
 		runtimeService:      newInstrumentedRuntimeService(runtimeService),
 		imageService:        newInstrumentedImageManagerService(imageService),
 		keyring:             credentialprovider.NewDockerKeyring(),
+		legacyLogProvider:   legacyLogProvider,
 	}
 
 	typedVersion, err := kubeRuntimeManager.runtimeService.Version(kubeRuntimeAPIVersion)
@@ -182,7 +194,7 @@ func NewKubeGenericRuntimeManager(
 		imagePullQPS,
 		imagePullBurst)
 	kubeRuntimeManager.runner = lifecycle.NewHandlerRunner(httpClient, kubeRuntimeManager, kubeRuntimeManager)
-	kubeRuntimeManager.containerGC = NewContainerGC(runtimeService, podDeletionProvider, kubeRuntimeManager)
+	kubeRuntimeManager.containerGC = NewContainerGC(runtimeService, podStateProvider, kubeRuntimeManager)
 
 	kubeRuntimeManager.versionCache = cache.NewObjectCache(
 		func() (interface{}, error) {
